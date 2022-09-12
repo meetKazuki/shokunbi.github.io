@@ -3,28 +3,25 @@ title: "On Improving Data Consistency — _A Retrospective_"
 date: 2022-09-03 16:01:01
 ---
 
-## Short Intro
+A general goal for database systems is to ensure data consistency. Consistency here means the data adheres to constraints (formal and informal). And if one piece of information is
+stored multiple times, then they all agree. But how can we ensure that? What are some things we should not do in order to achieve this consistency?
 
-You might be working (or have worked) on a project that requires you to track count of a certain metric in your system. You might be wondering how best to go about it.
-Well, take a seat, because today we are going to dive in on how not to go about it. To go on this journey, we will be discussing about a fictional project (which I may or may not have worked on).
+Let’s pick a scenario (it’s a real life example). You are tasked with building the next social media app. Your users will create posts and share them with the public. This content
+will receive interactions from other users. Your users are interested in how well the content is performing. How do you ensure this information is as consistent and correct as possible?
 
+To get through this, let’s retrospect on some of the things I did wrong...
 
-## Initial Business Requirement
-
-To set the groundwork, a peep into some functionalities of this hypothetical project:
+In one of my previous lives, I was tasked with developing a social media application. Not to get into deep implementation, but this app was supposed to allow our users to carry out the following operations:
 * A user can create a post.
-* A User can like a post.
-* A User can make comments to a post.
-* A User can like comments on a post.
+* A user can like a post.
+* A user can make comments on a post.
 
-Some of the stats our users were interested in were:
-- The number of posts a user has created.
-- The number of posts a user has liked.
-- The number of comments a post has.
+We tracked certain stats in this application: the number of posts a user has made, the number of likes a post has, and the number of comments a post has, among other things. This information was represented in our database this way:
+- We had a collection that kept information about a user in our system (we will call it “user_collection”).
+- We had another collection (we will call it “post_collection”) that kept information about posts created in our system.
+- We also had a collection (we will call it “like_collection”) that kept information about the posts liked and the users who liked them.
 
-## Assumption Number One (keeping count in the database)
-
-Our earlier schema looked like this:
+The representation looked this way:
 
 ```json
 user_collection: {
@@ -43,7 +40,7 @@ user_collection: {
   }
 }
 
-video_collection: {
+post_collection: {
   _id: string,
   owner_id: {
     type: string,
@@ -61,85 +58,101 @@ video_collection: {
     }
   }
 }
+
+like_collection: {
+  _id: string,
+  user_id: {
+    type: string,
+    refs: <user_collection>
+  },
+  post_id: {
+    type: string,
+    refs: <post_collection>
+  },
+}
 ```
-The first mistake we did was to increment this count when there was a document insertion or a decrement when a document was removed. So, if a user created a post, we `$inc`remented the `number_of_posts` column in the `user` collection by `1`, and if a user deleted a post, we `$inc`remented the post by `-1`. The code looked like this:
+So what happens when a user carries out any of these operations? If let’s say a user creates a post, we did this in our code:
 
 ```ts
 // post.ts
-await post_repository.create({ ...postData })
-await user_repository.updateOne({ _id: user_id }, { $inc: { 'stats.number_of_posts': 1 } })
+await post_repository.create({ ...post_data });
+await user_repository.updateOne({ _id: user_id }, { $inc: { 'stats.number_of_posts': 1 } });
 ```
 
-If a user liked a post, we did this:
+And if a user likes a post, our code looks like this:
+
+```ts
+await like_reposistory.create({ user_id, post_id });
+await post_repository.updateOne({ video_id }, { $inc: { 'stats.number_of_likes': 1 } });
+await user_repository.updateOne({ _id: user_id }, { $inc: { 'stats.number_of_posts_liked': 1 } });
+```
+What we did was: whenever a user created or liked a post, we created a record in the database and stored a counter. So if you create a post, we increment the “number_of_posts” count in the “user_collection” by 1, and so on.
+
+#### Enter Inconsistent Data
+
+All was going well until we realized that the stats reported ("number_of_comments," “number_of_likes”) did not match  the records that were in the database. What went wrong? Let’s take a look at our code again:
 
 ```ts
 // like.ts
 await like_reposistory.create({ user_id, post_id });
-await video_repository.updateOne({ video_id }, { $inc: { 'stats.number_of_likes': 1 } })
-await user_repository.updateOne({ _id: user_id }, { $inc: { 'stats.number_of_posts_liked': 1 } })
+await post_repository.updateOne({ video_id }, { $inc: { 'stats.number_of_likes': 1 } });
+await user_repository.updateOne({ _id: user_id }, { $inc: { 'stats.number_of_posts_liked': 1 } });
 ```
-In the event where a user commented on a post, we did this:
+There is a big chance that when a user carries out a “like” operation, one of these might fail. What if multiple users are trying to like a post at the same time? Network failure?
+There is no guarantee that this block of code will execute successfully. To improve our result (or so we thought), we moved the count operation code to an update trigger.
+
+#### Triggers Happy? Still More Inconsistent Data
+
+Database triggers (in MongoDB) allow you to execute server-side logic whenever a document is added, updated, or removed in a linked MongoDB cluster.
+It uses change streams to listen for changes to documents in a collection and pass database events to their associated trigger functions. We moved our code around and it looked like this
+with this implementation:
 
 ```ts
-// post.ts
-await video_repository.updateOne({ parent_post_id }, { $inc: { 'stats.number_of_comments': 1 } })  // increment number of comments count for the parent post.
-```
+import { ChangeStream, ChangeStreamDocument } from 'mongodb';
+import LikeModel from '@schemas/like';
+import LockModel from '@schemas/lock';
 
-THIS WAS A BAD IDEA! I can't scream loud enough how bad this was! It wasn't long before everything fell out of place. A post will have 10 comment records in the database, but the `number_of_comments` count returned was 6. What solution did we propose? We doubled-down on the blunder.
-
-## Assumption Number Two (using database transactions)
-
-If you look closely (not even closely), you can see where failures can occur and cause inconsistent counts. So we decided to wrap these operations in database transactions. With this we thought the inconsistency issue will be resolved. We had a helper method for handling DB transactions:
-
-```ts
-// transaction.ts
-type TransactionCallback = (session: ClientSession) => Promise<void>
-
-export const Transaction = async (callback: TransactionCallback) => {
-  const session: ClientSession = await startSession()
-
-  session.startTransaction()
-
+LikeModel.watch([], { fullDocument: 'updateLookup' }).on('change', async (data) => {
   try {
-    await callback(session)
-    await session.commitTransaction()
-  } catch (error: any) {
-    await session.abortTransaction()
-    logger.error(error)
-    throw new InternalServerError(error)
-  } finally {
-    session.endSession()
+    const uniqueId = `${data.operationType}-${(data._id as any)._data}-like`;
+    await LockModel.create({ uniqueId });
+
+    if (data.operationType === 'insert') {
+      /** a whole lot of other boilerplate code */
+      await like_reposistory.create({ user_id, post_id });
+      await post_repository.updateOne({ video_id }, { $inc: { 'stats.number_of_likes': 1 } });
+      await user_repository.updateOne({ _id: user_id }, { $inc: { 'stats.number_of_posts_liked': 1 } });
+    }
+    // some other logic too to check for when a document is deleted
+  } catch (error) {
+    // ...
   }
-}
+}) as ChangeStream
 ```
-So if there was a `like` operation, our new structure looked like:
+This solution failed as much as the reason for failure of our previous solution. We still ended up getting inconsistent counts with respect to the number of records in the database.
+
+#### The Reliable Source?
+
+Having gone through all these, we still were not able to keep the count up-to-date. And a lot of times, we had to go into the database, run a query, and update the counter to match the records in the database.
+It wasn’t ideal and it took a lot of time to debug issues that we shouldn’t have dealt with to begin with. So, we did something very simple — `countDocument`.
+
+> “A man with one watch always knows the time. A man with two watches is never sure.”
+
+Counting the records turned out to be the reliable way to achieve this consistency. At the time, it was okay for us, we didn’t have a gazillion number of records and upfront,
+there was no performance issue counting these records on the fly. Getting information about those metrics was as simple as:
 
 ```ts
-/* import relevant modules */
-
-//...
-await Transaction(async, (session) => {
-  await like_reposistory.create({ user_id, post_id }, { session })
-  await video_repository.updateOne({ video_id }, { $inc: { 'stats.number_of_likes': 1 } }, { session })
-  await user_repository.updateOne({ _id: user_id }, { $inc: { 'stats.number_of_posts_liked': 1 } }, { session })
-});
+// for getting number of likes for a post
+await like_repository.countDocument({ post_id });
 ```
+#### What Did We (I) Learn?
 
-We still found ourselves in the same spot. Adding transactions did nothing (at least significantly) to improve the consistency of this count. Now you might be thinking, _they have learnt their lesson. Surely, something better this time_ Nope! We went deeper.
+* It is redundant to store the count of database records, but whether or not you should do it depends on your situation (in our case, it wasn’t right).
+* Unless you have known performance problems, calculate the counts and totals on the fly in your application and don’t store them.
+* Database normalization rules say that you shouldn’t have any values in your database that you can programmatically construct based on other values in your database.
+* Of course, it’s a different situation if you have a gazillion number of records. In such a case, you will typically want to revisit your requirements.
 
-## Assumption Number Three (using database triggers)
+#### Resources
 
-We tried as a last resort. We used database triggers on update to keep the counts. I wish this is the part where I say we finally achieved the consisteny we were looking, but far from it. We ended up implementing a fix that was difficult to reason, which in turn made maintainace a pain.
-So, we reverted back to what we should have done earlier...
-
-## What We Should Have Done (Calculate the counts on the fly)
-
-<!-- <!--Insert Thanos it brought me back to me meme/> -->
-
-Counting when a user requested it saved a history of debugging and hair-pulling. As we realized painfully, the trouble with redundancy in databases is that when the numbers disagree, you are unsure of which is authoritative. We broke the golden rule of optimizing too early. In our case, there was no performance problem(s) that restricted us from just counting on the fly.
-
-There is a saying "_A man with one watch always knows the time. A man with two watches is never sure_". I would advise to only store count if:
-* Performance issues stop you from getting the derived numbers when you need them. Or,
-* You have reason to believe that you are losing records from the main table through programmer error or deliberate or accidental user action.
-
-If consistency is what you are aiming, count those records on the fly...
+* MongoDB Database Triggers
+* https://www.mongodb.com/docs/manual/reference/method/db.collection.countDocuments/
